@@ -52,12 +52,12 @@ MED_CAPS_PAYLOAD = struct.pack('>HB', 0x0021, 4).decode('latin-1')
 # EOS also natively sends subtype 8, but we inject our own so the receiver gets
 # a complete contiguous set of subtypes 1 + 5-11 from the SDK.
 MED_INVENTORY_VALUES = {
-    MED_SUBTYPE_HW_REVISION:   "Photons",
+    MED_SUBTYPE_HW_REVISION:   "BCIX",
     MED_SUBTYPE_FW_REVISION:   "v1",
     MED_SUBTYPE_SW_REVISION:   "LldpDomAgent",
-    MED_SUBTYPE_SERIAL_NUMBER: "AS12276",
-    MED_SUBTYPE_MFR_NAME:      "SFMIX",
-    MED_SUBTYPE_MODEL_NAME:    "Internet Exchange",
+    MED_SUBTYPE_SERIAL_NUMBER: "AS16374",
+    # MED_SUBTYPE_MFR_NAME:      "BCIX",
+    # MED_SUBTYPE_MODEL_NAME:    "BCIX",
 }
 
 
@@ -187,6 +187,91 @@ def format_rx_power(intf_dom):
 
     return None
 
+def format_snr(intf_dom):
+    """Build a self-describing SNR string for LLDP-MED Model Name.
+
+    Parses the 'show interfaces transceiver dom | json' structure where
+    per-channel data lives under parameters.snr.channels.
+    """
+    params = intf_dom.get("parameters", {})
+    snr_info = params.get("snr", {})
+    channels = snr_info.get("channels", {})
+
+    # Filter out the aggregate channel key "-"
+    lane_keys = [k for k in channels if k != "-"]
+    if len(lane_keys) > 1:
+        snrs = []
+        all_dark = True
+        for ch in sorted(lane_keys, key=int):
+            val = channels[ch]
+            if val > -30.0:
+                all_dark = False
+            snrs.append("%.2f" % val)
+        if all_dark:
+            return None   # No light on any lane
+        label = "SNR dB:%s" % "/".join(snrs)
+        if len(label) > MED_ASSET_ID_MAX_LEN:
+            log_err("Asset ID too long (%d chars), skipping: %s" % (len(label), label))
+            return None
+        return label
+
+    if lane_keys:
+        val = channels[lane_keys[0]]
+        if val <= -30.0:
+            return None   # No light — port dark / unplugged
+        return "SNR dB:%.2f" % val
+
+    # Fallback: single-channel optics may only have the "-" key
+    if "-" in channels:
+        val = channels["-"]
+        if val <= -30.0:
+            return None
+        return "SNR dB:%.2f" % val
+
+    return None
+
+def format_pre_fec_ber(intf_dom):
+    """Build a self-describing SNR string for LLDP-MED Manufacturer Name.
+
+    Parses the 'show interfaces transceiver dom | json' structure where
+    per-channel data lives under parameters.preFecBERCurr.channels.
+    """
+    params = intf_dom.get("parameters", {})
+    snr_info = params.get("preFecBERCurr", {})
+    channels = snr_info.get("channels", {})
+
+    # Filter out the aggregate channel key "-"
+    lane_keys = [k for k in channels if k != "-"]
+    if len(lane_keys) > 1:
+        pre_fec_ber = []
+        all_dark = True
+        for ch in sorted(lane_keys, key=int):
+            val = channels[ch]
+            if val > -30.0:
+                all_dark = False
+            pre_fec_ber.append("%.2e" % val)
+        if all_dark:
+            return None   # No light on any lane
+        label = "pre-FEC BER:%s" % "/".join(pre_fec_ber)
+        if len(label) > MED_ASSET_ID_MAX_LEN:
+            log_err("Asset ID too long (%d chars), skipping: %s" % (len(label), label))
+            return None
+        return label
+
+    if lane_keys:
+        val = channels[lane_keys[0]]
+        if val <= -30.0:
+            return None   # No light — port dark / unplugged
+        return "pre-FEC BER:%.2e" % val
+
+    # Fallback: single-channel optics may only have the "-" key
+    if "-" in channels:
+        val = channels["-"]
+        if val <= -30.0:
+            return None
+        return "pre-FEC BER:%.2e" % val
+
+    return None
 
 class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
     def __init__(self, sdk):
@@ -204,6 +289,8 @@ class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
         # TLV type objects
         self.tlv_med_caps = None
         self.tlv_med_inventory = {}  # subtype -> (LldpTlvType, value)
+        self.tlv_med_mfr_name = None
+        self.tlv_med_model_name = None
         self.tlv_med_asset = None
 
         log("Agent constructed")
@@ -213,6 +300,8 @@ class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
         self.tlv_med_caps = eossdk.LldpTlvType(TIA_OUI, MED_SUBTYPE_CAPABILITIES)
         for st, val in MED_INVENTORY_VALUES.items():
             self.tlv_med_inventory[st] = (eossdk.LldpTlvType(TIA_OUI, st), val)
+        self.tlv_med_mfr_name = eossdk.LldpTlvType(TIA_OUI, MED_SUBTYPE_MFR_NAME)
+        self.tlv_med_model_name = eossdk.LldpTlvType(TIA_OUI, MED_SUBTYPE_MODEL_NAME)
         self.tlv_med_asset = eossdk.LldpTlvType(TIA_OUI, MED_SUBTYPE_ASSET_ID)
         self._read_config()
         # Defer first poll to on_timeout so the event loop is fully started
@@ -266,6 +355,8 @@ class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
             # malformed DOM data) is logged and skipped instead of escaping
             # on_timeout and crashing the whole agent via the SWIG director.
             try:
+                label_pre_fec_ber = format_pre_fec_ber(intf_dom)
+                label_snr = format_snr(intf_dom)
                 label = format_rx_power(intf_dom)
                 if label is None:
                     continue
@@ -274,6 +365,10 @@ class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
                 self.lldp_mgr.tx_tlv_set(neighbor, self.tlv_med_caps, MED_CAPS_PAYLOAD)
                 for st, (tlv, val) in self.tlv_med_inventory.items():
                     self.lldp_mgr.tx_tlv_set(neighbor, tlv, val)
+                if label_pre_fec_ber:
+                    self.lldp_mgr.tx_tlv_set(neighbor, self.tlv_med_mfr_name, label_pre_fec_ber)
+                if label_snr:
+                    self.lldp_mgr.tx_tlv_set(neighbor, self.tlv_med_model_name, label_snr)
                 self.lldp_mgr.tx_tlv_set(neighbor, self.tlv_med_asset, label)
                 updated.add(intf_name)
             except Exception as e:
@@ -288,6 +383,8 @@ class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
                 self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_caps)
                 for tlv, _ in self.tlv_med_inventory.values():
                     self.lldp_mgr.tx_tlv_del(neighbor, tlv)
+                self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_mfr_name)
+                self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_model_name)
                 self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_asset)
             except Exception:
                 pass
@@ -311,6 +408,8 @@ class LldpDomAgent(eossdk.AgentHandler, eossdk.TimeoutHandler):
                 self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_caps)
                 for tlv, _ in self.tlv_med_inventory.values():
                     self.lldp_mgr.tx_tlv_del(neighbor, tlv)
+                self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_mfr_name)
+                self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_model_name)
                 self.lldp_mgr.tx_tlv_del(neighbor, self.tlv_med_asset)
             except Exception:
                 pass
