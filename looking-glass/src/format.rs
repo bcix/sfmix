@@ -279,6 +279,118 @@ pub fn format_participants(participants: &crate::participants::ParticipantMap, m
     format!("{table}\n")
 }
 
+/// Render the flat list of assigned IX IPs with their tenant/ASN.
+pub fn format_ix_ip_assignments(
+    participants: &[crate::netbox::NetboxParticipant],
+    filter_asn: Option<u32>,
+    mode: ColorMode,
+) -> String {
+    let mut rows: Vec<(&str, &str, u32, &str, &str)> = participants
+        .iter()
+        .filter(|p| filter_asn.is_none_or(|a| p.asn == a))
+        .flat_map(|p| {
+            p.ip_addresses.iter().map(move |ip| {
+                (
+                    ip.address.as_str(),
+                    ip.family.as_str(),
+                    p.asn,
+                    p.name.as_str(),
+                    ip.status.as_str(),
+                )
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+
+    if rows.is_empty() {
+        return "No IX IP assignments.\n".to_string();
+    }
+
+    let mut builder = Builder::default();
+    builder.push_record([
+        bold_str("IP", mode),
+        bold_str("Family", mode),
+        bold_str("ASN", mode),
+        bold_str("Tenant", mode),
+        bold_str("Status", mode),
+    ]);
+    for (ip, family, asn, name, status) in &rows {
+        builder.push_record([
+            ip.to_string(),
+            family.to_string(),
+            format!("AS{asn}"),
+            name.to_string(),
+            status.to_string(),
+        ]);
+    }
+    let mut table = builder.build();
+    apply_style(&mut table, mode);
+    format!("{table}\n")
+}
+
+/// Render discovered ARP/NDP neighbors — one row per heard MAC. Conflicts and
+/// IPs not assigned on the IX (the claimant is mis-bound to an invalid address)
+/// are flagged.
+pub fn format_discovered_neighbors(
+    neighbors: &[DiscoveredNeighbor],
+    filter_asn: Option<u32>,
+    mode: ColorMode,
+) -> String {
+    let mut entries: Vec<_> = neighbors
+        .iter()
+        .filter(|n| filter_asn.is_none_or(|a| n.asn == Some(a)))
+        .collect();
+    entries.sort_by(|a, b| a.ip.cmp(&b.ip));
+
+    if entries.is_empty() {
+        return "No discovered neighbors.\n".to_string();
+    }
+
+    let mut builder = Builder::default();
+    builder.push_record([
+        bold_str("IP", mode),
+        bold_str("MAC", mode),
+        bold_str("ASN", mode),
+        bold_str("Last seen", mode),
+        bold_str("Flags", mode),
+    ]);
+    for n in &entries {
+        // Unassigned IPs carry no ASN; show a dash so the empty cell reads as
+        // intentional rather than missing data.
+        let asn = if n.assigned {
+            n.asn.map(|a| format!("AS{a}")).unwrap_or_default()
+        } else {
+            "—".to_string()
+        };
+        let mut flags: Vec<&str> = Vec::new();
+        if !n.assigned {
+            flags.push("UNASSIGNED");
+        }
+        if n.conflict {
+            flags.push("CONFLICT");
+        }
+        let flag = if flags.is_empty() {
+            String::new()
+        } else if mode == ColorMode::Plain {
+            flags.join(" ")
+        } else {
+            format!("{}", flags.join(" ").red())
+        };
+        for m in &n.macs {
+            builder.push_record([
+                n.ip.clone(),
+                m.mac.clone(),
+                asn.clone(),
+                m.last_seen.clone(),
+                flag.clone(),
+            ]);
+        }
+    }
+    let mut table = builder.build();
+    apply_style(&mut table, mode);
+    format!("{table}\n")
+}
+
 /// Render detail for a single participant — ports (including LAG members) and BGP sessions.
 pub fn format_participant_detail(
     p: &crate::participants::Participant,
@@ -855,4 +967,64 @@ pub async fn drain_stream(rx: &mut mpsc::Receiver<String>) -> String {
         lines.push(line);
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mac(mac: &str) -> DiscoveredMac {
+        DiscoveredMac {
+            mac: mac.to_string(),
+            first_seen: "2026-06-18T00:00:00Z".to_string(),
+            last_seen: "2026-06-18T00:05:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn discovered_neighbors_flag_unassigned_and_conflict() {
+        let neighbors = vec![
+            DiscoveredNeighbor {
+                ip: "192.0.2.10".to_string(),
+                family: "IPv4".to_string(),
+                asn: Some(64500),
+                tenant: Some("Acme".to_string()),
+                macs: vec![mac("aa:aa:aa:aa:aa:aa")],
+                conflict: false,
+                assigned: true,
+            },
+            DiscoveredNeighbor {
+                ip: "192.0.2.250".to_string(),
+                family: "IPv4".to_string(),
+                asn: None,
+                tenant: None,
+                macs: vec![mac("bb:bb:bb:bb:bb:bb"), mac("cc:cc:cc:cc:cc:cc")],
+                conflict: true,
+                assigned: false,
+            },
+        ];
+        let out = format_discovered_neighbors(&neighbors, None, ColorMode::Plain);
+        // The unassigned IP is flagged (and as a conflict), with a dash for ASN.
+        assert!(out.contains("UNASSIGNED"), "unassigned IP must be flagged:\n{out}");
+        assert!(out.contains("CONFLICT"), "conflict still flagged:\n{out}");
+        assert!(out.contains("—"), "unassigned ASN cell shows a dash:\n{out}");
+        // The assigned IP keeps its ASN and is not flagged unassigned.
+        assert!(out.contains("AS64500"));
+    }
+
+    #[test]
+    fn discovered_neighbors_asn_filter_excludes_unassigned() {
+        let neighbors = vec![DiscoveredNeighbor {
+            ip: "192.0.2.250".to_string(),
+            family: "IPv4".to_string(),
+            asn: None,
+            tenant: None,
+            macs: vec![mac("bb:bb:bb:bb:bb:bb")],
+            conflict: false,
+            assigned: false,
+        }];
+        // Filtering by an ASN drops IPs that carry no ASN (unassigned).
+        let out = format_discovered_neighbors(&neighbors, Some(64500), ColorMode::Plain);
+        assert_eq!(out, "No discovered neighbors.\n");
+    }
 }

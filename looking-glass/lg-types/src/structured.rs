@@ -137,6 +137,43 @@ pub struct ArpEntry {
     pub age_secs: Option<u64>,
 }
 
+// ── Discovered ARP/NDP Neighbors ────────────────────────────────────
+//
+// Passively heard on the IX fabric by lg-neighborhood-watch and accumulated
+// durably in lg-server. Distinct from `ArpEntry` (the switch ARP/NDP table):
+// this tracks *every* MAC heard claiming an IP, so multiple claimants surface
+// as a conflict rather than being collapsed to the kernel's single choice.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredMac {
+    pub mac: String,
+    /// RFC3339, earliest time this (ip, mac) was heard.
+    pub first_seen: String,
+    /// RFC3339, most recent time this (ip, mac) was heard.
+    pub last_seen: String,
+}
+
+fn default_assigned() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredNeighbor {
+    pub ip: String,
+    pub family: String,
+    pub asn: Option<u32>,
+    pub tenant: Option<String>,
+    /// All distinct MACs heard claiming this IP.
+    pub macs: Vec<DiscoveredMac>,
+    /// True when more than one MAC has been heard for this IP.
+    pub conflict: bool,
+    /// False when this IP is not an active NetBox assignment: the claimant is
+    /// mis-bound to an invalid/disallowed address on the IX. Defaults to true so
+    /// pre-existing on-disk store files (all assigned) still deserialize.
+    #[serde(default = "default_assigned")]
+    pub assigned: bool,
+}
+
 // ── CommandOutput enum ──────────────────────────────────────────────
 
 /// The unified output type for all looking glass commands.
